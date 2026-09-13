@@ -88,8 +88,11 @@ cmake --install build
 1. Abrí OBS Studio
 2. En el panel de **Fuentes**, hacé clic en `+` → **PraiseHim Source**
 3. Configurá:
-   - **URL del servidor**: `http://localhost` (o la IP donde corre PraiseHim)
-   - **Token OBS**: el UUID que aparece en la vista *OBS Studio* del panel web de PraiseHim
+   - **URL del servidor**: la dirección de PraiseHim (`http://localhost` en desarrollo)
+   - **Forma de conexión**:
+     - *Cuenta de PraiseHim* (recomendado): **Conectar cuenta** abre el navegador para iniciar sesión y
+       confirmar; después elegís el **Servicio**. La cuenta queda guardada para todas las fuentes de ese OBS.
+     - *Token OBS de un servicio*: pegá el token que aparece en la vista *OBS Studio* del panel web
    - **Modo**: elegí *Texto* o *Multimedia* según lo que quieras mostrar
 4. Ajustá el estilo, posición y fondo según tu preferencia
 5. La fuente se actualiza en tiempo real vía SSE cada vez que el presentador avanza una diapositiva

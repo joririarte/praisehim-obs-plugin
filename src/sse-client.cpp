@@ -34,8 +34,8 @@ static int curl_xfer_cb(void *clientp, curl_off_t, curl_off_t, curl_off_t, curl_
 }
 
 // ── Constructor / destructor ──────────────────────────────────
-SseClient::SseClient(std::string url, Callback callback)
-    : url_(std::move(url)), callback_(std::move(callback))
+SseClient::SseClient(std::string url, Callback callback, std::vector<std::string> headers)
+    : url_(std::move(url)), callback_(std::move(callback)), headers_(std::move(headers))
 {}
 
 SseClient::~SseClient()
@@ -70,6 +70,8 @@ void SseClient::run()
         curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Accept: text/event-stream");
         headers = curl_slist_append(headers, "Cache-Control: no-cache");
+        for (const auto &h : headers_)
+            headers = curl_slist_append(headers, h.c_str());
 
         curl_easy_setopt(curl, CURLOPT_URL,              url_.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER,       headers);
@@ -86,8 +88,14 @@ void SseClient::run()
 
         blog(LOG_INFO, "[PraiseHim] SSE iniciando conexión a: %s", url_.c_str());
         CURLcode res = curl_easy_perform(curl);
+        long status = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
 
-        if (res != CURLE_OK) {
+        if (status == 401 || status == 403 || status == 404 || status == 402) {
+            // No es un corte de red: reintentar cada 3 s no lo va a arreglar y solo le pega al
+            // servidor. 401 = la cuenta se desconectó o el token ya no vale; 404 = el servicio no existe.
+            blog(LOG_WARNING, "[PraiseHim] SSE rechazado por el servidor (HTTP %ld)", status);
+        } else if (res != CURLE_OK) {
             blog(LOG_WARNING, "[PraiseHim] SSE error curl (%d): %s",
                  (int)res, curl_easy_strerror(res));
         } else {
@@ -103,7 +111,8 @@ void SseClient::run()
             // Sleep interruptible: stop() llama stop_cv_.notify_all() para
             // despertar este wait inmediatamente en lugar de esperar 3 segundos
             std::unique_lock<std::mutex> lk(stop_mutex_);
-            stop_cv_.wait_for(lk, std::chrono::seconds(3),
+            bool rechazado = status == 401 || status == 403 || status == 404 || status == 402;
+            stop_cv_.wait_for(lk, std::chrono::seconds(rechazado ? 30 : 3),
                               [this] { return !running_.load(); });
         }
     }

@@ -6,6 +6,7 @@
 
 #include "praisehim-source.hpp"
 #include "sse-client.hpp"
+#include "account-connect.hpp"
 
 // La define CMakeLists desde `project(... VERSION)`; ver plugin-main.cpp.
 #ifndef PH_VERSION
@@ -14,10 +15,17 @@
 
 #include <obs-module.h>
 #include <obs-frontend-api.h>
+
+// El plugin usa APIs de OBS 28+ (texto informativo en las propiedades). Compilado contra headers más
+// viejos —el libobs-dev de Ubuntu 22.04 es 27.2— el error sería una lista de símbolos sin declarar.
+#if LIBOBS_API_MAJOR_VER < 28
+#error "obs-praisehim necesita los headers de OBS 28 o posterior (en Ubuntu 22.04: el paquete obs-studio del PPA oficial, no libobs-dev)"
+#endif
 #include <util/platform.h>
 #include <curl/curl.h>
 #include <stb_image.h>
 
+#include <QDesktopServices>
 #include <QFont>
 #include <QFontMetrics>
 #include <QImage>
@@ -28,6 +36,9 @@
 #include <QTextLayout>
 #include <QTextLine>
 #include <QTextOption>
+#include <QUrl>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -518,11 +529,50 @@ void PraiseHimData::request_render()
 //  Reconexión SSE
 // ═════════════════════════════════════════════════════════════
 
+// Qué define la conexión: si nada de esto cambió, no hace falta cortar el SSE.
+static std::string firma_conexion(const PraiseHimData &d)
+{
+    if (d.conn_type == CONN_ACCOUNT) {
+        PhCuentaGuardada c = ph_cuenta_actual();
+        return "cuenta|" + c.server_url + "|" + c.token + "|" + std::to_string(d.servicio_id);
+    }
+    return "token|" + d.server_url + "|" + d.obs_token;
+}
+
+void PraiseHimData::reconnect_if_changed()
+{
+    std::string firma = firma_conexion(*this);
+    if (firma == conn_firma) return;
+    conn_firma = firma;
+    reconnect_sse();
+}
+
 void PraiseHimData::reconnect_sse()
 {
     if (sse) {
         sse->stop();
         sse.reset();
+    }
+
+    if (conn_type == CONN_ACCOUNT) {
+        // El token va en un header y no en la URL: no queda en el log de nginx ni en el de OBS. El
+        // servidor es el que emitió el token, que puede no ser el que quedó escrito en el campo.
+        PhCuentaGuardada cuenta = ph_cuenta_actual();
+        if (cuenta.server_url.empty() || cuenta.token.empty()) {
+            blog(LOG_INFO, "[PraiseHim] reconnect_sse: sin cuenta conectada — saltando");
+            return;
+        }
+        std::string url = cuenta.server_url + "/api/obs/state?"
+                        + (servicio_id > 0 ? "servicio=" + std::to_string(servicio_id) + "&" : "")
+                        + "v=" + PH_VERSION;
+        blog(LOG_INFO, "[PraiseHim] Conectando SSE con la cuenta a: %s", url.c_str());
+        sse = std::make_unique<SseClient>(
+            url,
+            [this](const SlideState &s) { on_state(s); },
+            std::vector<std::string>{"Authorization: Bearer " + cuenta.token}
+        );
+        sse->start();
+        return;
     }
 
     if (server_url.empty() || obs_token.empty()) {
@@ -563,12 +613,212 @@ static uint32_t ph_get_height(void *data)
     return static_cast<PraiseHimData *>(data)->canvas_h;
 }
 
+// ═════════════════════════════════════════════════════════════
+//  Conectar cuenta (#42 fase 5)
+// ═════════════════════════════════════════════════════════════
+
+// Una fuente guardada antes de que existiera la conexión por cuenta no tiene `conn_type`: si ya tenía
+// un token pegado, sigue con el token. Solo las fuentes nuevas arrancan ofreciendo la cuenta.
+static ConnType conn_type_de(obs_data_t *settings)
+{
+    if (!obs_data_has_user_value(settings, "conn_type")) {
+        const char *token = obs_data_get_string(settings, "obs_token");
+        return (token && *token) ? CONN_TOKEN : CONN_ACCOUNT;
+    }
+    return obs_data_get_int(settings, "conn_type") == CONN_TOKEN ? CONN_TOKEN : CONN_ACCOUNT;
+}
+
+void PraiseHimData::set_account_msg(const std::string &msg, bool error)
+{
+    std::lock_guard<std::mutex> lk(account_msg_mutex);
+    account_msg       = msg;
+    account_msg_error = error;
+}
+
+void PraiseHimData::stop_account_worker()
+{
+    account_cancel = true;
+    if (account_thread.joinable())
+        account_thread.join();
+    account_cancel = false;
+    account_busy   = false;
+}
+
+// La cuenta es de toda la instalación: al conectarla o desconectarla, todas las fuentes PraiseHim
+// que la usan tienen que reconectar, no solo la del diálogo abierto.
+static bool reconectar_fuente(void *, obs_source_t *src)
+{
+    const char *id = obs_source_get_unversioned_id(src);
+    if (id && strcmp(id, "praisehim_source") == 0) {
+        auto *d = static_cast<PraiseHimData *>(obs_obj_get_data(src));
+        if (d) {
+            d->reconnect_if_changed();
+            obs_source_update_properties(src);
+        }
+    }
+    return true;
+}
+
+// Lo que un hilo de la cuenta le deja al hilo de la interfaz. Viaja con una referencia débil a la
+// fuente: si la borraron mientras se esperaba al navegador, la tarea no toca nada.
+struct TareaCuenta {
+    obs_weak_source_t *weak = nullptr;
+    bool               conexion = false;   // true = terminó "Conectar cuenta"; false = actualizar lista
+    AccountConnectFlow::Resultado resultado;
+    PhCuenta           cuenta;
+    std::string        token_consultado;   // para no pisar una cuenta que cambió mientras tanto
+    std::string        server;             // el servidor contra el que se conectó
+};
+
+static void aplicar_tarea_cuenta(void *param)
+{
+    std::unique_ptr<TareaCuenta> t(static_cast<TareaCuenta *>(param));
+    obs_source_t *src = obs_weak_source_get_source(t->weak);
+    obs_weak_source_release(t->weak);
+    if (!src) return;
+    auto *d = static_cast<PraiseHimData *>(obs_obj_get_data(src));
+
+    PhCuentaGuardada guardada = ph_cuenta_actual();
+    if (t->conexion) {
+        if (t->resultado.ok) {
+            PhCuentaGuardada nueva;
+            nueva.server_url   = t->server;
+            nueva.token        = t->resultado.token;
+            nueva.organizacion = t->cuenta.ok ? t->cuenta.organizacion : t->resultado.organizacion;
+            nueva.usuario      = t->cuenta.ok ? t->cuenta.usuario : t->resultado.usuario;
+            nueva.obs_incluido = t->cuenta.ok ? t->cuenta.obs_incluido : true;
+            nueva.servicios    = t->cuenta.servicios;
+            ph_cuenta_guardar(nueva);
+            if (d) d->set_account_msg("", false);
+            blog(LOG_INFO, "[PraiseHim] Cuenta conectada (%s)", nueva.organizacion.c_str());
+        } else if (d) {
+            d->set_account_msg(t->resultado.error, true);
+        }
+    } else if (guardada.token == t->token_consultado) {
+        if (t->cuenta.ok) {
+            guardada.organizacion = t->cuenta.organizacion;
+            guardada.usuario      = t->cuenta.usuario;
+            guardada.obs_incluido = t->cuenta.obs_incluido;
+            guardada.servicios    = t->cuenta.servicios;
+            ph_cuenta_guardar(guardada);
+            if (d) d->set_account_msg("", false);
+        } else if (t->cuenta.http_status == 401) {
+            // Revocada desde PraiseHim, o el usuario ya no puede presentar: no sirve de nada guardarla.
+            ph_cuenta_olvidar();
+            if (d) d->set_account_msg(obs_module_text("AccountRevoked"), true);
+        } else if (d) {
+            d->set_account_msg(obs_module_text("AccountUnreachable"), true);
+        }
+    }
+
+    if (d) d->account_busy = false;
+    obs_enum_sources(reconectar_fuente, nullptr);
+    obs_source_release(src);
+}
+
+static void encolar_tarea(PraiseHimData *d, TareaCuenta *t)
+{
+    t->weak = obs_source_get_weak_source(d->source);
+    obs_queue_task(OBS_TASK_UI, aplicar_tarea_cuenta, t, false);
+}
+
+// "Actualizar lista de servicios", y también al crear la fuente: la lista puede haber cambiado desde
+// la última vez, y es como el plugin se entera de que la cuenta se desconectó desde PraiseHim.
+static void refrescar_cuenta(PraiseHimData *d)
+{
+    PhCuentaGuardada cuenta = ph_cuenta_actual();
+    if (cuenta.token.empty() || d->account_busy) return;
+    d->stop_account_worker();
+    d->account_busy = true;
+    d->account_thread = std::thread([d, cuenta] {
+        auto *t = new TareaCuenta();
+        t->cuenta           = ph_cuenta_servicios(cuenta.server_url, cuenta.token);
+        t->token_consultado = cuenta.token;
+        if (d->account_cancel) {
+            delete t;
+            return;
+        }
+        encolar_tarea(d, t);
+    });
+}
+
+static bool cb_account_connect(obs_properties_t *, obs_property_t *, void *data)
+{
+    auto *d = static_cast<PraiseHimData *>(data);
+    d->stop_account_worker();
+
+    obs_data_t *settings = obs_source_get_settings(d->source);
+    std::string server   = obs_data_get_string(settings, "server_url");
+    obs_data_release(settings);
+    while (!server.empty() && server.back() == '/') server.pop_back();
+
+    auto flujo = std::make_shared<AccountConnectFlow>();
+    std::string url, error;
+    if (!flujo->preparar(server, ph_nombre_dispositivo(), url, error)) {
+        d->set_account_msg(error, true);
+        return true;
+    }
+    // Se abre desde acá, en el hilo de la interfaz, que es donde Qt lo admite.
+    if (!QDesktopServices::openUrl(QUrl::fromEncoded(QByteArray::fromStdString(url)))) {
+        d->set_account_msg(std::string(obs_module_text("AccountOpenBrowserFailed")) + " " + url, true);
+    } else {
+        d->set_account_msg("", false);
+    }
+
+    d->account_busy = true;
+    d->account_thread = std::thread([d, flujo, server] {
+        auto *t = new TareaCuenta();
+        t->conexion  = true;
+        t->resultado = flujo->esperar_y_canjear(d->account_cancel);
+        if (t->resultado.ok) t->cuenta = ph_cuenta_servicios(server, t->resultado.token);
+        t->server = server;
+        if (d->account_cancel) {
+            delete t;
+            return;
+        }
+        encolar_tarea(d, t);
+    });
+    return true;
+}
+
+static bool cb_account_cancel(obs_properties_t *, obs_property_t *, void *data)
+{
+    auto *d = static_cast<PraiseHimData *>(data);
+    d->stop_account_worker();
+    d->set_account_msg("", false);
+    return true;
+}
+
+static bool cb_account_refresh(obs_properties_t *, obs_property_t *, void *data)
+{
+    refrescar_cuenta(static_cast<PraiseHimData *>(data));
+    return true;
+}
+
+static bool cb_account_disconnect(obs_properties_t *, obs_property_t *, void *data)
+{
+    auto *d = static_cast<PraiseHimData *>(data);
+    d->stop_account_worker();
+    PhCuentaGuardada cuenta = ph_cuenta_actual();
+    if (!cuenta.token.empty()) {
+        // Revocarla en el servidor no tiene que trabar la interfaz: se olvida acá de inmediato, y si
+        // no hay red el token queda sin usar hasta que alguien lo revoque desde PraiseHim.
+        std::thread([cuenta] { ph_cuenta_desconectar(cuenta.server_url, cuenta.token); }).detach();
+    }
+    ph_cuenta_olvidar();
+    d->set_account_msg(obs_module_text("AccountDisconnected"), false);
+    obs_enum_sources(reconectar_fuente, nullptr);
+    return true;
+}
+
 // ── Valores por defecto ───────────────────────────────────────
 static void ph_get_defaults(obs_data_t *settings)
 {
     obs_data_set_default_int   (settings, "mode",          MODE_TEXT);
     obs_data_set_default_string(settings, "server_url",    "http://localhost");
     obs_data_set_default_string(settings, "obs_token",     "");
+    obs_data_set_default_int   (settings, "conn_type",     CONN_ACCOUNT);
+    obs_data_set_default_int   (settings, "servicio_id",   0);
     obs_data_set_default_int   (settings, "canvas_w",      1920);
     obs_data_set_default_int   (settings, "canvas_h",      1080);
 
@@ -634,6 +884,16 @@ static void apply_visibility(obs_properties_t *props, obs_data_t *settings)
     const bool is_text = (mode == MODE_TEXT);
     const bool is_mm   = (mode == MODE_MULTIMEDIA);
 
+    // Conexión: la cuenta o el token manual
+    const bool por_cuenta = conn_type_de(settings) == CONN_ACCOUNT;
+    const bool conectada  = !ph_cuenta_actual().token.empty();
+    set_vis(root, "obs_token",          !por_cuenta);
+    set_vis(root, "account_status",     por_cuenta);
+    set_vis(root, "account_connect",    por_cuenta);
+    set_vis(root, "servicio_id",        por_cuenta && conectada);
+    set_vis(root, "account_refresh",    por_cuenta && conectada);
+    set_vis(root, "account_disconnect", por_cuenta && conectada);
+
     // Secciones completas según el modo
     set_vis(root, "location_group",   is_text);
     set_vis(root, "typography_group", is_text);
@@ -673,7 +933,77 @@ static obs_properties_t *ph_get_properties(void *data)
     // ── Sección: Conexión ─────────────────────────────────────
     {
         obs_properties_t *g = obs_properties_create();
+
+        obs_property_t *p_conn = obs_properties_add_list(
+            g, "conn_type", obs_module_text("ConnType"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+        obs_property_list_add_int(p_conn, obs_module_text("ConnAccount"), CONN_ACCOUNT);
+        obs_property_list_add_int(p_conn, obs_module_text("ConnToken"),   CONN_TOKEN);
+        obs_property_set_modified_callback(p_conn, cb_visibility);
+
         obs_properties_add_text(g, "server_url", obs_module_text("ServerUrl"), OBS_TEXT_DEFAULT);
+
+        // ── Por cuenta ──
+        PhCuentaGuardada cuenta = ph_cuenta_actual();
+        std::string estado;
+        bool        estado_error = false;
+        {
+            std::lock_guard<std::mutex> lk(d->account_msg_mutex);
+            if (!d->account_msg.empty()) {
+                estado       = d->account_msg;
+                estado_error = d->account_msg_error;
+            }
+        }
+        if (d->account_busy && cuenta.token.empty()) {
+            estado = obs_module_text("AccountWaiting");
+            estado_error = false;
+        } else if (estado.empty() || (!estado_error && !cuenta.token.empty())) {
+            if (cuenta.token.empty()) {
+                if (estado.empty()) estado = obs_module_text("AccountNotConnected");
+            } else {
+                estado = std::string(obs_module_text("AccountConnectedAs")) + " " + cuenta.usuario
+                       + " — " + cuenta.organizacion;
+                if (!cuenta.obs_incluido) {
+                    estado += "\n" + std::string(obs_module_text("AccountPlanWithoutObs"));
+                    estado_error = true;
+                }
+            }
+        }
+        obs_property_t *p_estado = obs_properties_add_text(g, "account_status", estado.c_str(), OBS_TEXT_INFO);
+        obs_property_text_set_info_type(p_estado, estado_error ? OBS_TEXT_INFO_WARNING : OBS_TEXT_INFO_NORMAL);
+
+        if (d->account_busy && cuenta.token.empty()) {
+            obs_properties_add_button2(g, "account_connect", obs_module_text("AccountCancel"),
+                                       cb_account_cancel, d);
+        } else {
+            obs_properties_add_button2(g, "account_connect",
+                                       obs_module_text(cuenta.token.empty() ? "AccountConnect" : "AccountReconnect"),
+                                       cb_account_connect, d);
+        }
+
+        obs_property_t *p_srv = obs_properties_add_list(
+            g, "servicio_id", obs_module_text("Servicio"), OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+        long long por_defecto = 0;
+        for (const auto &sv : cuenta.servicios)
+            if (sv.es_default) por_defecto = sv.id;
+        // "0" es el servicio por defecto, aunque cambie de nombre: así una fuente nueva queda andando
+        // sin elegir nada, que es lo que pide el análisis (§15).
+        std::string def = std::string(obs_module_text("ServicioDefault"));
+        for (const auto &sv : cuenta.servicios) {
+            if (sv.id == por_defecto) {
+                def += " (" + sv.nombre + ")";
+                break;
+            }
+        }
+        obs_property_list_add_int(p_srv, def.c_str(), 0);
+        for (const auto &sv : cuenta.servicios)
+            if (sv.id != por_defecto) obs_property_list_add_int(p_srv, sv.nombre.c_str(), sv.id);
+
+        obs_properties_add_button2(g, "account_refresh", obs_module_text("AccountRefresh"),
+                                   cb_account_refresh, d);
+        obs_properties_add_button2(g, "account_disconnect", obs_module_text("AccountDisconnect"),
+                                   cb_account_disconnect, d);
+
+        // ── Por token ──
         obs_properties_add_text(g, "obs_token",  obs_module_text("OBSToken"),  OBS_TEXT_PASSWORD);
         obs_properties_add_group(props, "conn_group", obs_module_text("Connection"),
                                  OBS_GROUP_NORMAL, g);
@@ -824,12 +1154,12 @@ static void ph_update(void *data, obs_data_t *settings)
         d->load_logo_image();
     }
 
-    // Reconectar SSE si cambió la URL o el token
-    if (new_url != d->server_url || new_token != d->obs_token) {
-        d->server_url = new_url;
-        d->obs_token  = new_token;
-        d->reconnect_sse();
-    }
+    // Reconectar SSE si cambió algo de la conexión
+    d->conn_type   = conn_type_de(settings);
+    d->server_url  = new_url;
+    d->obs_token   = new_token;
+    d->servicio_id = obs_data_get_int(settings, "servicio_id");
+    d->reconnect_if_changed();
 
     // Forzar re-render con la configuración nueva
     d->on_state(d->state);
@@ -841,10 +1171,15 @@ static void *ph_create(obs_data_t *settings, obs_source_t *source)
     auto *d    = new PraiseHimData();
     d->source  = source;
 
+    // Fija la forma de conexión deducida, para que el combo muestre la que de verdad se usa.
+    if (!obs_data_has_user_value(settings, "conn_type"))
+        obs_data_set_int(settings, "conn_type", conn_type_de(settings));
+
     // Arrancar hilo de render
     d->render_thread = std::thread(&PraiseHimData::render_worker_loop, d);
 
     ph_update(d, settings);
+    if (d->conn_type == CONN_ACCOUNT) refrescar_cuenta(d);
 
     // Renderizar frame inicial
     d->on_state(d->state);
@@ -879,7 +1214,8 @@ static void ph_destroy(void *data)
 {
     auto *d = static_cast<PraiseHimData *>(data);
 
-    // Detener SSE
+    // Detener SSE y el flujo de "Conectar cuenta" si quedó esperando al navegador
+    d->stop_account_worker();
     if (d->sse) {
         d->sse->stop();
         d->sse.reset();

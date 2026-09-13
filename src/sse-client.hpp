@@ -9,6 +9,7 @@
 #include <string>
 #include <functional>
 #include <thread>
+#include <vector>
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
@@ -18,7 +19,8 @@ class SseClient {
 public:
     using Callback = std::function<void(const SlideState &)>;
 
-    SseClient(std::string url, Callback callback);
+    // `headers`: cabeceras extra, como el Authorization del plugin conectado por cuenta (fase 5).
+    SseClient(std::string url, Callback callback, std::vector<std::string> headers = {});
     ~SseClient();
 
     void start();
@@ -36,6 +38,7 @@ private:
 
     std::string        url_;
     Callback           callback_;
+    std::vector<std::string> headers_;
     std::thread        thread_;
 
     // Buffer de línea en curso y de campo "data:" del evento actual

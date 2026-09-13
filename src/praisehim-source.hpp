@@ -27,6 +27,8 @@ enum SourceMode   { MODE_TEXT = 0, MODE_MULTIMEDIA = 1 };
 enum TextPosition { POS_UPPER = 0, POS_MIDDLE = 1, POS_LOWER = 2, POS_CUSTOM = 3 };
 enum BgType       { BG_NONE = 0, BG_SOLID = 1, BG_IMAGE = 2 };
 enum OfflineType  { OFFLINE_BLACK = 0, OFFLINE_LOGO = 1 };
+// Cómo se conecta al servidor: con la cuenta (fase 5 de #42) o pegando el token OBS de un servicio.
+enum ConnType     { CONN_ACCOUNT = 0, CONN_TOKEN = 1 };
 
 // ── Datos de la fuente ────────────────────────────────────────
 struct PraiseHimData {
@@ -34,8 +36,20 @@ struct PraiseHimData {
     obs_source_t *source = nullptr;
 
     // Conexión
+    ConnType    conn_type = CONN_ACCOUNT;
     std::string server_url;   // ej. "http://localhost"
     std::string obs_token;
+    long long   servicio_id = 0;   // 0 = el servicio por defecto de la organización
+    // Lo que definió la conexión SSE actual: si cambia algo de esto, hay que reconectar.
+    std::string conn_firma;
+
+    // "Conectar cuenta": el hilo que espera al navegador o actualiza la lista de servicios.
+    std::thread         account_thread;
+    std::atomic<bool>   account_cancel{false};
+    std::atomic<bool>   account_busy{false};
+    std::mutex          account_msg_mutex;
+    std::string         account_msg;        // último aviso para mostrar en las propiedades
+    bool                account_msg_error = false;
 
     // Canvas
     uint32_t canvas_w = 1920;
@@ -114,6 +128,9 @@ struct PraiseHimData {
 
     // ── Métodos ───────────────────────────────────────────────
     void reconnect_sse();
+    void reconnect_if_changed();
+    void stop_account_worker();
+    void set_account_msg(const std::string &msg, bool error);
     void on_state(const SlideState &s);
     void request_render();
     void render_worker_loop();

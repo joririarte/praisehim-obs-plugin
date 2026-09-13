@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 # Estuvo en 1.0.0 mientras los releases iban por 2.2.0, así que el número que el plugin creía tener
 # estaba tres versiones atrasado — inservible para decidir si hay que actualizar. El workflow de
 # release ahora compara ambos y falla si difieren, para que no vuelva a separarse en silencio.
-project(obs-praisehim VERSION 3.0.0 LANGUAGES CXX)
+project(obs-praisehim VERSION 4.0.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -48,6 +48,7 @@ add_library(obs-praisehim MODULE
     src/sse-client.cpp
     src/praisehim-source.cpp
     src/stb_image_impl.cpp
+    src/account-connect.cpp
 )
 
 # Sin prefijo "lib" para que el archivo se llame obs-praisehim.so/.dll
@@ -71,6 +72,11 @@ target_link_libraries(obs-praisehim PRIVATE
     CURL::libcurl
     nlohmann_json::nlohmann_json
 )
+
+# "Conectar cuenta" escucha en 127.0.0.1 con sockets del sistema (account-connect.cpp).
+if(WIN32)
+    target_link_libraries(obs-praisehim PRIVATE ws2_32)
+endif()
 
 # ── Locale ────────────────────────────────────────────────────
 set(PLUGIN_DATA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/data")

@@ -23,7 +23,7 @@ cmake --install build   # con LOCAL_INSTALL=ON no hace falta sudo
 ```
 `-DLOCAL_INSTALL=ON` instala en `~/.config/obs-studio/plugins/obs-praisehim/` (directorio de usuario, detectado automáticamente al reiniciar OBS).
 
-**Linux, sin OBS instalado:** `sudo apt install cmake libobs-dev libcurl4-openssl-dev qt6-base-dev` y los mismos pasos de cmake (sin conflicto en este caso). Si OBS está en ruta no estándar, agregar `-DOBS_DIR=/ruta/a/obs-studio/install`.
+**Linux, sin OBS instalado:** `sudo apt install cmake libobs-dev libcurl4-openssl-dev qt6-base-dev` y los mismos pasos de cmake (sin conflicto en este caso). ⚠️ `libobs-dev` tiene que ser de **OBS 28 o posterior**: el de Ubuntu 22.04 es 27.2 y no compila (faltan `OBS_TEXT_INFO` y `obs_property_text_set_info_type`). Ahí, y en el workflow de release, se usa el paquete `obs-studio` del PPA oficial, que trae los headers (OBS 30.2 en jammy). Si OBS está en ruta no estándar, agregar `-DOBS_DIR=/ruta/a/obs-studio/install`.
 
 **Windows / macOS:** ver `README.md` (requiere pasar `-DOBS_DIR` apuntando a la instalación de OBS).
 
@@ -68,11 +68,38 @@ Cubre además el cambio de escena y el preview del diálogo de propiedades, que 
 mismos callbacks. El cache `current_img_url`/`current_img` hace que al mostrar no haya
 descarga si el presentador no cambió de página mientras estuvo oculta.
 
+### Conectar cuenta (`account-connect.cpp`, #42 fase 5)
+Segunda forma de conexión, junto al token manual (`conn_type`: `CONN_ACCOUNT` / `CONN_TOKEN`). Es OAuth
+para escritorio —**loopback + PKCE**—, detallado en `docs/control-remoto/analisis.md` §15 y en
+`ObsAccountService` del backend:
+- `AccountConnectFlow::preparar` abre un socket en `127.0.0.1:0` (puerto que elige el sistema) y arma
+  `<server>/obs/conectar?redirect_uri=http://127.0.0.1:<p>/callback&state&code_challenge(S256)&dispositivo`.
+  El navegador se abre con `QDesktopServices::openUrl` **desde el callback del botón** (hilo de UI).
+- `esperar_y_canjear` corre en `account_thread`: `select` de 500 ms para poder cancelar, contesta 404 a
+  lo que no sea `/callback` (el favicon), **ignora un `state` ajeno** y sigue esperando, y canjea en
+  `POST /api/obs/cuenta/token` con el verifier. Sockets del sistema y no Qt Network, que OBS no garantiza
+  en todas las plataformas; en Windows `winsock2.h` va antes que cualquier otro include y enlaza `ws2_32`.
+- ⚠️ **La cuenta es una por instalación**, en `plugin_config/obs-praisehim/cuenta.json`
+  (`ph_cuenta_actual/guardar/olvidar`), **no en los ajustes de la fuente**: el *Cancelar* del diálogo
+  de propiedades limpia y restaura los ajustes del momento en que se abrió, y con el token ahí se perdía
+  la conexión recién hecha. Cada fuente guarda solo `servicio_id` (0 = el por defecto).
+- El resultado vuelve al hilo de UI con `obs_queue_task(OBS_TASK_UI, …)` y una referencia **débil** a la
+  fuente (si la borraron mientras se esperaba, no se toca nada). Ahí se guarda la cuenta, se reconectan
+  **todas** las fuentes PraiseHim (`obs_enum_sources`) y `obs_source_update_properties` refresca el
+  diálogo abierto. `ph_destroy` cancela y hace join del hilo antes de liberar.
+- Con cuenta, el SSE va a `/api/obs/state?servicio=<id>` con `Authorization: Bearer pho_…` en un
+  **header** (no en la URL). Una fuente guardada antes de esta versión, sin `conn_type` y con token,
+  sigue por token (`conn_type_de`).
+- Al crear la fuente se refresca la lista de servicios en segundo plano: un 401 ahí es que la cuenta se
+  revocó (o el usuario pasó a músico) y se olvida.
+
 ### SSE Client
 - Hilo dedicado con libcurl (`curl_easy_perform` bloqueante)
 - Para interrumpir al cerrar: el write callback retorna 0 cuando `!running_`
 - El backend envía heartbeat cada 15s para evitar que curl quede bloqueado indefinidamente
 - Parseo de líneas SSE: solo procesa `data:`, ignora `event:`, `id:`, comentarios
+- Cabeceras extra por constructor (el `Authorization` de la cuenta). Un 401/402/403/404 no es un corte de
+  red: reintenta cada 30 s en vez de 3
 
 ### Rendering (QPainter en hilo worker)
 - `QImage(W, H, Format_ARGB32)` → `QPainter` → `convertToFormat(Format_ARGB32)`
