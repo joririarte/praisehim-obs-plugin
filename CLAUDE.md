@@ -87,11 +87,26 @@ para escritorio —**loopback + PKCE**—, detallado en `docs/control-remoto/ana
   fuente (si la borraron mientras se esperaba, no se toca nada). Ahí se guarda la cuenta, se reconectan
   **todas** las fuentes PraiseHim (`obs_enum_sources`) y `obs_source_update_properties` refresca el
   diálogo abierto. `ph_destroy` cancela y hace join del hilo antes de liberar.
+- ⚠️ **Nunca `obs_source_update_properties` (ni `reconectar_fuente`) dentro del callback de un botón**:
+  rearma el diálogo y borra el botón mientras Qt todavía atiende su clic. «Desconectar cuenta» lo hacía
+  y OBS se caía en `libQt6Core` (#77); ahora va por `obs_queue_task`, como el resultado de conectar.
+  Tampoco un `modified_callback` en un campo de texto: lo rearma en cada tecla y se pierde el foco.
 - Con cuenta, el SSE va a `/api/obs/state?servicio=<id>` con `Authorization: Bearer pho_…` en un
   **header** (no en la URL). Una fuente guardada antes de esta versión, sin `conn_type` y con token,
   sigue por token (`conn_type_de`).
 - Al crear la fuente se refresca la lista de servicios en segundo plano: un 401 ahí es que la cuenta se
   revocó (o el usuario pasó a músico) y se olvida.
+
+### Recibir desde la app de escritorio (`local_url`, #77)
+Con la cuenta conectada, el campo **«Recibir desde la app de escritorio»** (`local_url`, vacío por
+defecto) hace que el SSE vaya a `local_url + /api/obs/state` en vez de a la nube, con el mismo `Bearer
+pho_…`: la computadora activada le pregunta a la nube si la cuenta vale y la recuerda para aceptarla sin
+internet (`docs/escritorio/analisis.md` §3.3, paso 4). **La cuenta se sigue conectando, listando y
+desconectando contra `server_url`** (la nube): el inicio de sesión no puede pasar por la computadora.
+Con `local_url` no viaja `servicio` y el combo se oculta —en la red local la computadora es el
+servicio—, y las imágenes del slide y el logo se piden a la computadora (`base_contenido()`), porque sin
+internet la nube no las sirve. En modo token no hace falta: alcanza con poner la computadora en «URL
+del servidor» y su token.
 
 ### SSE Client
 - Hilo dedicado con libcurl (`curl_easy_perform` bloqueante)

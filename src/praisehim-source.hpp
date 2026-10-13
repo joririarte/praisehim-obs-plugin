@@ -40,6 +40,9 @@ struct PraiseHimData {
     std::string server_url;   // ej. "http://localhost"
     std::string obs_token;
     long long   servicio_id = 0;   // 0 = el servicio por defecto de la organización
+    // Con la cuenta, recibir de la app de escritorio en vez de la nube (#77): lo que presenta esa
+    // computadora, con o sin internet. Vacío = de la nube. La cuenta se conecta igual contra la nube.
+    std::string local_url;
     // Lo que definió la conexión SSE actual: si cambia algo de esto, hay que reconectar.
     std::string conn_firma;
 
@@ -128,6 +131,7 @@ struct PraiseHimData {
 
     // ── Métodos ───────────────────────────────────────────────
     void reconnect_sse();
+    std::string base_contenido() const;
     void reconnect_if_changed();
     void stop_account_worker();
     void set_account_msg(const std::string &msg, bool error);

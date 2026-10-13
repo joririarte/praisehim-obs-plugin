@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.22)
 # Estuvo en 1.0.0 mientras los releases iban por 2.2.0, así que el número que el plugin creía tener
 # estaba tres versiones atrasado — inservible para decidir si hay que actualizar. El workflow de
 # release ahora compara ambos y falla si difieren, para que no vuelva a separarse en silencio.
-project(obs-praisehim VERSION 4.0.2 LANGUAGES CXX)
+project(obs-praisehim VERSION 5.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

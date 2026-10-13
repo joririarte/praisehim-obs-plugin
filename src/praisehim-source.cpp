@@ -417,7 +417,7 @@ void PraiseHimData::render_multimedia_frame(const SlideState &s)
     // manda, sale al aire el logo de la organización (el mismo que ven las pantallas),
     // no el archivo local configurado en el plugin — ese queda para "sin contenido".
     if (s.logo && !s.logoImageUrl.empty()) {
-        std::string full_url = server_url + s.logoImageUrl;
+        std::string full_url = base_contenido() + s.logoImageUrl;
         if (full_url != current_logo_url) {
             QImage img = fetch_image(full_url);
             if (!img.isNull()) {
@@ -435,7 +435,7 @@ void PraiseHimData::render_multimedia_frame(const SlideState &s)
     // Decidir qué mostrar
     if (s.live && !s.black && !s.logo && !s.imageUrl.empty()) {
         // Cargar imagen si cambió la URL
-        std::string full_url = server_url + s.imageUrl;
+        std::string full_url = base_contenido() + s.imageUrl;
         if (full_url != current_img_url) {
             QImage img = fetch_image(full_url);
             if (!img.isNull()) {
@@ -529,12 +529,20 @@ void PraiseHimData::request_render()
 //  Reconexión SSE
 // ═════════════════════════════════════════════════════════════
 
+// De dónde vienen las imágenes del slide: del mismo lugar que el estado. Recibiendo de la app de
+// escritorio, sin internet, la nube no las sirve.
+std::string PraiseHimData::base_contenido() const
+{
+    if (conn_type == CONN_ACCOUNT && !local_url.empty()) return local_url;
+    return server_url;
+}
+
 // Qué define la conexión: si nada de esto cambió, no hace falta cortar el SSE.
 static std::string firma_conexion(const PraiseHimData &d)
 {
     if (d.conn_type == CONN_ACCOUNT) {
         PhCuentaGuardada c = ph_cuenta_actual();
-        return "cuenta|" + c.server_url + "|" + c.token + "|" + std::to_string(d.servicio_id);
+        return "cuenta|" + c.server_url + "|" + c.token + "|" + std::to_string(d.servicio_id) + "|" + d.local_url;
     }
     return "token|" + d.server_url + "|" + d.obs_token;
 }
@@ -562,8 +570,10 @@ void PraiseHimData::reconnect_sse()
             blog(LOG_INFO, "[PraiseHim] reconnect_sse: sin cuenta conectada — saltando");
             return;
         }
-        std::string url = cuenta.server_url + "/api/obs/state?"
-                        + (servicio_id > 0 ? "servicio=" + std::to_string(servicio_id) + "&" : "")
+        // Desde la app de escritorio la computadora es el servicio: el elegido no viaja.
+        const bool local = !local_url.empty();
+        std::string url = (local ? local_url : cuenta.server_url) + "/api/obs/state?"
+                        + (!local && servicio_id > 0 ? "servicio=" + std::to_string(servicio_id) + "&" : "")
                         + "v=" + PH_VERSION;
         blog(LOG_INFO, "[PraiseHim] Conectando SSE con la cuenta a: %s", url.c_str());
         sse = std::make_unique<SseClient>(
@@ -807,7 +817,10 @@ static bool cb_account_disconnect(obs_properties_t *, obs_property_t *, void *da
     }
     ph_cuenta_olvidar();
     d->set_account_msg(obs_module_text("AccountDisconnected"), false);
-    obs_enum_sources(reconectar_fuente, nullptr);
+    // ⚠️ Encolado, nunca acá: `reconectar_fuente` rearma el diálogo de propiedades
+    // (`obs_source_update_properties`), y hacerlo dentro del clic borra el botón mientras Qt todavía
+    // atiende su señal. OBS se caía en libQt6Core al apretar «Desconectar cuenta».
+    obs_queue_task(OBS_TASK_UI, [](void *) { obs_enum_sources(reconectar_fuente, nullptr); }, nullptr, false);
     return true;
 }
 
@@ -819,6 +832,7 @@ static void ph_get_defaults(obs_data_t *settings)
     obs_data_set_default_string(settings, "obs_token",     "");
     obs_data_set_default_int   (settings, "conn_type",     CONN_ACCOUNT);
     obs_data_set_default_int   (settings, "servicio_id",   0);
+    obs_data_set_default_string(settings, "local_url",     "");
     obs_data_set_default_int   (settings, "canvas_w",      1920);
     obs_data_set_default_int   (settings, "canvas_h",      1080);
 
@@ -890,7 +904,11 @@ static void apply_visibility(obs_properties_t *props, obs_data_t *settings)
     set_vis(root, "obs_token",          !por_cuenta);
     set_vis(root, "account_status",     por_cuenta);
     set_vis(root, "account_connect",    por_cuenta);
-    set_vis(root, "servicio_id",        por_cuenta && conectada);
+    const char *local  = obs_data_get_string(settings, "local_url");
+    const bool desde_local = local && *local;
+    set_vis(root, "servicio_id",        por_cuenta && conectada && !desde_local);
+    set_vis(root, "local_url",          por_cuenta && conectada);
+    set_vis(root, "local_info",         por_cuenta && conectada && desde_local);
     set_vis(root, "account_refresh",    por_cuenta && conectada);
     set_vis(root, "account_disconnect", por_cuenta && conectada);
 
@@ -1002,6 +1020,13 @@ static obs_properties_t *ph_get_properties(void *data)
                                    cb_account_refresh, d);
         obs_properties_add_button2(g, "account_disconnect", obs_module_text("AccountDisconnect"),
                                    cb_account_disconnect, d);
+
+        // App de escritorio (#77): la misma cuenta, recibiendo de la computadora.
+        obs_property_t *p_local = obs_properties_add_text(g, "local_url", obs_module_text("LocalUrl"), OBS_TEXT_DEFAULT);
+        // Sin modified_callback: en un campo de texto rearma el diálogo en cada tecla y se pierde el
+        // foco. El combo de servicio y el aviso se ajustan al volver a abrir las propiedades.
+        obs_property_set_long_description(p_local, obs_module_text("LocalUrlHint"));
+        obs_properties_add_text(g, "local_info", obs_module_text("LocalUrlInfo"), OBS_TEXT_INFO);
 
         // ── Por token ──
         obs_properties_add_text(g, "obs_token",  obs_module_text("OBSToken"),  OBS_TEXT_PASSWORD);
@@ -1159,6 +1184,10 @@ static void ph_update(void *data, obs_data_t *settings)
     d->server_url  = new_url;
     d->obs_token   = new_token;
     d->servicio_id = obs_data_get_int(settings, "servicio_id");
+    std::string local = obs_data_get_string(settings, "local_url");
+    while (!local.empty() && (local.back() == '/' || local.back() == ' ')) local.pop_back();
+    while (!local.empty() && local.front() == ' ') local.erase(0, 1);
+    d->local_url   = local;
     d->reconnect_if_changed();
 
     // Forzar re-render con la configuración nueva
